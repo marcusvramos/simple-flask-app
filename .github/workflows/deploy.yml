@@ -86,43 +86,15 @@ jobs:
         
         # Update application and restart
         echo "🔧 Updating application..."
-        ssh ubuntu@${{ env.INSTANCE_IP }} << 'EOF'
+        ssh ubuntu@${{ env.INSTANCE_IP }} 'bash -s' << 'EOF'
           set -e
           cd /home/ubuntu/flask-app
           
-          # Update virtual environment if needed
-          if [ ! -d "venv" ]; then
-            echo "Creating virtual environment..."
-            python3 -m venv venv
-          fi
-          
-          # Install/Update dependencies
+          # Update virtual environment and dependencies
+          echo "📦 Installing dependencies..."
           source venv/bin/activate
           pip install --quiet --upgrade pip
           pip install --quiet -r requirements.txt
-          
-          # Check if service exists, create only if needed
-          if ! systemctl list-units --type=service | grep -q flask-app.service; then
-            echo "Creating systemd service..."
-            sudo tee /etc/systemd/system/flask-app.service > /dev/null << 'SERVICE'
-          [Unit]
-          Description=Flask App
-          After=network.target
-          
-          [Service]
-          User=ubuntu
-          WorkingDirectory=/home/ubuntu/flask-app
-          Environment="PATH=/home/ubuntu/flask-app/venv/bin"
-          ExecStart=/home/ubuntu/flask-app/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 2 --threads 4 app:app
-          Restart=always
-          RestartSec=10
-          
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
-            sudo systemctl daemon-reload
-            sudo systemctl enable flask-app
-          fi
           
           # Restart application
           echo "🔄 Restarting application..."
@@ -136,6 +108,12 @@ jobs:
             echo "❌ Flask service failed to start!"
             sudo journalctl -u flask-app -n 20 --no-pager
             exit 1
+          fi
+          
+          # Check if nginx is running
+          if ! sudo systemctl is-active --quiet nginx; then
+            echo "⚠️ Nginx is not running, starting it..."
+            sudo systemctl start nginx
           fi
           
           echo "✅ Application deployed successfully!"
