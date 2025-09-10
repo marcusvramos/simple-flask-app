@@ -69,33 +69,42 @@ jobs:
         EOF
     
     - name: Deploy application
+      id: deploy
       run: |
+        set -e
+        
         # Copy files to server
+        echo "📦 Copying files to server..."
         rsync -avz --delete \
           --exclude='.git' \
           --exclude='__pycache__' \
           --exclude='*.pyc' \
           --exclude='.env' \
           --exclude='venv' \
+          --exclude='test_app.py' \
           ./ ubuntu@${{ env.INSTANCE_IP }}:/home/ubuntu/flask-app/
         
-        # Setup and restart application
+        # Update application and restart
+        echo "🔧 Updating application..."
         ssh ubuntu@${{ env.INSTANCE_IP }} << 'EOF'
           set -e
           cd /home/ubuntu/flask-app
           
-          # Install Python and dependencies
-          sudo apt-get update
-          sudo apt-get install -y python3-pip python3-venv nginx
+          # Update virtual environment if needed
+          if [ ! -d "venv" ]; then
+            echo "Creating virtual environment..."
+            python3 -m venv venv
+          fi
           
-          # Create virtual environment
-          python3 -m venv venv
+          # Install/Update dependencies
           source venv/bin/activate
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --quiet --upgrade pip
+          pip install --quiet -r requirements.txt
           
-          # Create systemd service
-          sudo tee /etc/systemd/system/flask-app.service > /dev/null << 'SERVICE'
+          # Check if service exists, create only if needed
+          if ! systemctl list-units --type=service | grep -q flask-app.service; then
+            echo "Creating systemd service..."
+            sudo tee /etc/systemd/system/flask-app.service > /dev/null << 'SERVICE'
           [Unit]
           Description=Flask App
           After=network.target
@@ -106,43 +115,69 @@ jobs:
           Environment="PATH=/home/ubuntu/flask-app/venv/bin"
           ExecStart=/home/ubuntu/flask-app/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 2 --threads 4 app:app
           Restart=always
+          RestartSec=10
           
           [Install]
           WantedBy=multi-user.target
           SERVICE
+            sudo systemctl daemon-reload
+            sudo systemctl enable flask-app
+          fi
           
-          # Configure Nginx
-          sudo tee /etc/nginx/sites-available/flask-app > /dev/null << 'NGINX'
-          server {
-              listen 80;
-              server_name _;
-              
-              location / {
-                  proxy_pass http://127.0.0.1:8080;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-              }
-          }
-          NGINX
-          
-          # Enable site
-          sudo ln -sf /etc/nginx/sites-available/flask-app /etc/nginx/sites-enabled/
-          sudo rm -f /etc/nginx/sites-enabled/default
-          
-          # Restart services
-          sudo systemctl daemon-reload
-          sudo systemctl enable flask-app
+          # Restart application
+          echo "🔄 Restarting application..."
           sudo systemctl restart flask-app
-          sudo nginx -t
-          sudo systemctl restart nginx
+          
+          # Wait for service to start
+          sleep 5
+          
+          # Check service status
+          if ! sudo systemctl is-active --quiet flask-app; then
+            echo "❌ Flask service failed to start!"
+            sudo journalctl -u flask-app -n 20 --no-pager
+            exit 1
+          fi
+          
+          echo "✅ Application deployed successfully!"
         EOF
     
     - name: Verify deployment
+      id: verify
       run: |
+        echo "⏳ Waiting for application to be ready..."
         sleep 10
-        curl -f http://${{ env.INSTANCE_IP }}/api/health || exit 1
+        
+        # Test health endpoint
+        echo "🔍 Testing health endpoint..."
+        for i in {1..5}; do
+          if curl -f -s http://${{ env.INSTANCE_IP }}/api/health; then
+            echo "✅ Health check passed!"
+            break
+          else
+            echo "⚠️ Health check attempt $i failed, retrying..."
+            sleep 5
+          fi
+          
+          if [ $i -eq 5 ]; then
+            echo "❌ Health check failed after 5 attempts!"
+            echo "Checking application logs..."
+            ssh ubuntu@${{ env.INSTANCE_IP }} "sudo journalctl -u flask-app -n 30 --no-pager"
+            exit 1
+          fi
+        done
+        
+        # Test all endpoints
+        echo "🔍 Testing all endpoints..."
+        endpoints=("/api/health" "/api/info" "/api/status")
+        for endpoint in "${endpoints[@]}"; do
+          echo "Testing $endpoint..."
+          if ! curl -f -s http://${{ env.INSTANCE_IP }}$endpoint > /dev/null; then
+            echo "❌ Endpoint $endpoint failed!"
+            exit 1
+          fi
+        done
+        
+        echo "✅ All endpoints verified successfully!"
     
     - name: Send Discord notification - Success
       if: success()
